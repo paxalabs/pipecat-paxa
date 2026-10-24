@@ -159,6 +159,58 @@ async def test_live_interruption_cancels_without_reconnecting():
     assert not errors(up)
 
 
+async def test_live_interruption_after_delivery_needs_no_cancel():
+    # Paxa streams far faster than real time, so an interruption often comes after
+    # the reply's audio has all arrived and its context has closed. Nothing is left
+    # to cancel, and the next reply speaks on the same session.
+    first = "This reply reaches the client well before anyone has heard it. " * 3
+    async with FakePaxa(Behavior(chunk_delay=0)) as paxa:
+        down, up = await run_test(
+            live(paxa),
+            frames_to_send=[
+                TTSSpeakFrame(text=first.strip()),
+                SleepFrame(sleep=0.3),
+                InterruptionFrame(),
+                TTSSpeakFrame(text="Next."),
+                SleepFrame(sleep=0.3),
+            ],
+        )
+    (session,) = paxa.sessions
+    assert {"type": "cancel"} not in session.frames
+    assert [leg.text for leg in session.legs] == [first.strip() + "\n", "Next.\n"]
+    assert audio_of(down) == spoken_audio(session)
+    assert not errors(up)
+
+
+async def test_live_cancel_that_lands_after_paxa_finished_the_leg():
+    # What the live API sends when a cancel reaches it after it finished the leg: the
+    # rest of the leg's audio, the leg's flushed, then cancelled with seq 0. The audio
+    # after the interruption is dropped, and the next reply speaks on the same session.
+    text = "This sentence is still playing when the user starts to talk. " * 4
+    async with FakePaxa(Behavior(chunk_delay=0, delivery_delay=0.005)) as paxa:
+        down, up = await run_test(
+            live(paxa),
+            frames_to_send=[
+                TTSSpeakFrame(text=text.strip()),
+                SleepFrame(sleep=0.05),
+                InterruptionFrame(),
+                SleepFrame(sleep=0.5),
+                TTSSpeakFrame(text="Next."),
+                SleepFrame(sleep=0.3),
+            ],
+        )
+    (session,) = paxa.sessions
+    assert {"type": "cancel"} in session.frames
+    assert session.sent.index("cancelled:0") > session.sent.index("flushed:1")
+    leg_audio = leg_pcm(1, utf16_len(text.strip() + "\n"))
+    next_audio = leg_pcm(2, utf16_len("Next.\n"))
+    audio = audio_of(down)
+    assert audio.endswith(next_audio)
+    heard = audio[: -len(next_audio)]
+    assert 0 < len(heard) < len(leg_audio) and leg_audio.startswith(heard)
+    assert not errors(up)
+
+
 async def test_live_rate_limit_drops_the_turn_and_recovers():
     async with FakePaxa(Behavior(rate_limited_attempts={1})) as paxa:
         down, up = await run_test(

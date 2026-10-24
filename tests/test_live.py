@@ -114,6 +114,28 @@ def test_interrupting_sent_speech_cancels_and_drops_until_cancelled():
     assert session.next_frame(0.2) == {"type": "text", "text": "Again.\n"}
 
 
+def test_a_cancel_voids_the_flushes_sent_before_it():
+    # Paxa drops every frame sent before a cancel, so a flush sent before it is never
+    # answered, and the next flushed answers the next context's flush.
+    session = ready_session()
+    session.add_text("a", "Short.")
+    session.request_flush("a")
+    session.next_frame(0.0)
+    charge(session, 1, "Short.\n")
+    session.on_flushed(1)
+    assert session.next_frame(0.1) == {"type": "flush"}
+    assert session.interrupt("a") is True
+    session.on_cancelled()
+    session.add_text("b", "Next.")
+    session.request_flush("b")
+    session.next_frame(0.2)
+    charge(session, 2, "Next.\n")
+    session.on_flushed(2)
+    assert session.next_frame(0.3) == {"type": "flush"}
+    finished = session.on_flushed(2).finished
+    assert finished is not None and finished.context_id == "b"
+
+
 def test_interrupting_unsent_speech_needs_no_cancel():
     session = ready_session()
     session.add_text("a", "One.")

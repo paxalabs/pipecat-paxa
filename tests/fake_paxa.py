@@ -123,6 +123,12 @@ class Behavior:
     ignore_cancel: bool = False
     # Accept the upgrade, then send nothing at all.
     mute: bool = False
+    # Seconds to wait before answering the WebSocket upgrade.
+    upgrade_delay: float = 0.0
+    # Seconds each server message waits on the way to the client. With chunk_delay=0,
+    # Paxa finishes a leg long before the client has heard it, as the real API does:
+    # it streams about 60 times faster than real time.
+    delivery_delay: float = 0.0
 
 
 @dataclass
@@ -138,6 +144,9 @@ class SessionLog:
     headers: dict[str, str]
     frames: list[dict[str, Any]] = field(default_factory=list)
     legs: list[Leg] = field(default_factory=list)
+    # What the server sent, in order: event types with their seq ("flushed:1"),
+    # and "audio" for binary frames.
+    sent: list[str] = field(default_factory=list)
     close_code: int | None = None
 
 
@@ -226,6 +235,8 @@ class FakePaxa:
     async def _live(self, request: web.Request) -> web.StreamResponse:
         if not self._authorized(request):
             return problem("unauthorized", 401)
+        if self.behavior.upgrade_delay:
+            await asyncio.sleep(self.behavior.upgrade_delay)
         ws = web.WebSocketResponse(autoping=True)
         await ws.prepare(request)
         log = SessionLog(headers=dict(request.headers))
@@ -252,12 +263,14 @@ class _LiveSession:
         self.cancel_through = 0
         self.pending = 0
         self.queue: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+        self.outbox: asyncio.Queue[str | bytes] = asyncio.Queue()
         self.closed = False
         self.last_activity = asyncio.get_running_loop().time()
 
     async def run(self) -> None:
         worker = asyncio.create_task(self._work())
         idle = asyncio.create_task(self._idle_watch())
+        writer = asyncio.create_task(self._write())
         try:
             async for message in self.ws:
                 if message.type != WSMsgType.TEXT:
@@ -288,6 +301,7 @@ class _LiveSession:
         finally:
             worker.cancel()
             idle.cancel()
+            writer.cancel()
             self.closed = True
             self.log.close_code = self.log.close_code or self.ws.close_code
 
@@ -316,9 +330,37 @@ class _LiveSession:
     async def send(self, event: dict[str, Any]) -> bool:
         if self.closed or self.ws.closed:
             return False
-        await self.ws.send_str(json.dumps(event, ensure_ascii=False))
-        self.last_activity = asyncio.get_running_loop().time()
+        seq = event.get("seq")
+        self.log.sent.append(event["type"] if seq is None else f"{event['type']}:{seq}")
+        await self._deliver(json.dumps(event, ensure_ascii=False))
         return True
+
+    async def send_audio(self, chunk: bytes) -> bool:
+        if self.closed or self.ws.closed:
+            return False
+        self.log.sent.append("audio")
+        await self._deliver(chunk)
+        return True
+
+    async def _deliver(self, message: str | bytes) -> None:
+        self.last_activity = asyncio.get_running_loop().time()
+        if self.behavior.delivery_delay:
+            await self.outbox.put(message)
+        elif isinstance(message, bytes):
+            await self.ws.send_bytes(message)
+        else:
+            await self.ws.send_str(message)
+
+    async def _write(self) -> None:
+        while True:
+            message = await self.outbox.get()
+            await asyncio.sleep(self.behavior.delivery_delay)
+            if self.ws.closed:
+                return
+            if isinstance(message, bytes):
+                await self.ws.send_bytes(message)
+            else:
+                await self.ws.send_str(message)
 
     async def close(self, code: int, reason: str) -> None:
         if self.closed:
@@ -464,10 +506,8 @@ class _LiveSession:
                 leg.cancelled = True
                 break
             await asyncio.sleep(self.behavior.chunk_delay)
-            if self.closed or self.ws.closed:
+            if not await self.send_audio(chunk):
                 return False
-            await self.ws.send_bytes(chunk)
-            self.last_activity = asyncio.get_running_loop().time()
             if spans and index == 0 and halves[0]:
                 await self.send({"type": "timing", "seq": seq, "spans": halves[0]})
         else:
