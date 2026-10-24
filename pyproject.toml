@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-paxa"
+dynamic = ["version"]
+description = "Paxa text-to-speech for Pipecat: Thai, English and Mandarin voices over a live WebSocket or HTTP"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Paxa Labs" }]
+keywords = ["pipecat", "paxa", "tts", "text-to-speech", "thai", "voice-agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "aiohttp>=3.14.4,<4",
+    "loguru~=0.7.3",
+    "pipecat-ai>=1.14.0,<2",
+    "websockets>=13.1",
+]
+
+[project.optional-dependencies]
+examples = ["pipecat-ai[openai,runner,webrtc]>=1.14.0,<2"]
+
+[project.urls]
+Homepage = "https://paxalabs.com"
+Documentation = "https://github.com/paxalabs/pipecat-paxa#readme"
+Repository = "https://github.com/paxalabs/pipecat-paxa"
+Issues = "https://github.com/paxalabs/pipecat-paxa/issues"
+Changelog = "https://github.com/paxalabs/pipecat-paxa/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.400",
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=1.0,<2",
+    "ruff>=0.14,<1",
+]
+
+[tool.hatch.version]
+path = "src/pipecat_paxa/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_paxa"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "tests",
+    "examples",
+    ".env.example",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "D", "E", "F", "I", "RUF006", "UP", "W"]
+ignore = ["ASYNC109", "D105"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"examples/*" = ["D"]
+
+[tool.pyright]
+include = ["src"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+# Services narrow `_settings` to their own Settings class, as Pipecat's services do.
+reportIncompatibleVariableOverride = false
