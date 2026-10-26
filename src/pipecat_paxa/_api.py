@@ -94,10 +94,10 @@ _EXPECTED_WAV = (b"RIFF", b"WAVE", b"fmt ", 16, 1, 1, SAMPLE_RATE, 16, b"data")
 class WavHeaderStripper:
     """Strips the 44-byte header from a WAV stream, leaving its 16-bit PCM.
 
-    Paxa has no raw PCM output, so the services ask for WAV: 24 kHz 16-bit mono
-    PCM behind a canonical 44-byte header, with 0xFFFFFFFF sizes when streamed.
-    A header that describes any other audio raises WavHeaderError instead of
-    being played.
+    Paxa also serves headerless pcm. The services ask for WAV so they can check
+    the format before any audio plays: 24 kHz 16-bit mono PCM behind a canonical
+    44-byte header, with 0xFFFFFFFF sizes when streamed. A header that describes
+    any other audio raises WavHeaderError instead of being played.
     """
 
     def __init__(self) -> None:

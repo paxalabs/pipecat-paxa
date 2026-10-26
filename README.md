@@ -126,8 +126,8 @@ Open http://localhost:7860 in your browser and talk to the bot.
 
 ## Notes
 
-- **Audio**: Both services produce 24 kHz 16-bit mono audio, which Pipecat resamples when
-  the pipeline's output rate differs, as on 8 kHz phone calls.
+- **Audio**: Both services request 24 kHz 16-bit mono audio from Paxa, which Pipecat
+  resamples when the pipeline's output rate differs, as on 8 kHz phone calls.
 - **Plan limits**: An open live session holds one of your plan's concurrent speech
   connections for as long as the service runs, and each synthesized segment counts as a
   request toward the plan's per-minute limit. Speech refused for a limit is reported as an
