@@ -4,11 +4,10 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""What the Paxa API expects from a client: defaults, headers, audio framing and errors."""
+"""What the Paxa API expects from a client: defaults, headers, audio formats and errors."""
 
 import json
 import re
-import struct
 
 from pipecat.transcriptions.language import Language
 from pipecat.utils.errors import ErrorCategory
@@ -21,9 +20,14 @@ DEFAULT_VOICE = "foithong"
 
 CLIENT_NAME = f"pipecat-paxa/{__version__}"
 
-# Paxa serves WAV as 16-bit mono PCM at 24 kHz on every model.
-SAMPLE_RATE = 24000
-BYTES_PER_SECOND = SAMPLE_RATE * 2
+# Paxa's pcm is 16-bit little-endian mono with no header, at 24 kHz unless the
+# request names another rate its model serves. Every rate costs the same, and a
+# rate the model doesn't serve answers unsupported_format.
+DEFAULT_SAMPLE_RATE = 24000
+MODEL_SAMPLE_RATES: dict[str, frozenset[int]] = {
+    "paxa-tts-flash-v2": frozenset({8000, 16000, 22050, 24000, 32000, 44100, 48000}),
+    "paxa-tts-flash-v1": frozenset({DEFAULT_SAMPLE_RATE}),
+}
 
 LANGUAGES = frozenset({"auto", "th", "en", "zh"})
 MIN_SPEED = 0.5
@@ -82,59 +86,28 @@ def check_language(language: object) -> None:
         raise ValueError(f"Paxa reads auto, th, en or zh, got {language!r}")
 
 
-class WavHeaderError(Exception):
-    """Paxa sent audio in a format the service does not play."""
+def request_sample_rate(model: object, output_rate: int) -> int:
+    """The pcm rate to ask Paxa for: the pipeline's own if the model serves it, else 24 kHz.
 
-
-_WAV_HEADER = struct.Struct("<4sI4s4sIHHIIHH4sI")
-# RIFF, WAVE, a 16-byte fmt chunk of PCM (1), mono, 24 kHz, 16 bits, then data.
-_EXPECTED_WAV = (b"RIFF", b"WAVE", b"fmt ", 16, 1, 1, SAMPLE_RATE, 16, b"data")
-
-
-class WavHeaderStripper:
-    """Strips the 44-byte header from a WAV stream, leaving its 16-bit PCM.
-
-    Paxa also serves headerless pcm. The services ask for WAV so they can check
-    the format before any audio plays: 24 kHz 16-bit mono PCM behind a canonical
-    44-byte header, with 0xFFFFFFFF sizes when streamed. A header that describes
-    any other audio raises WavHeaderError instead of being played.
+    At the pipeline's rate the audio plays as it arrives. At 24 kHz, which every
+    model serves, Pipecat resamples it.
     """
+    rates = MODEL_SAMPLE_RATES.get(model, frozenset()) if isinstance(model, str) else frozenset()
+    return output_rate if output_rate in rates else DEFAULT_SAMPLE_RATE
 
-    def __init__(self) -> None:
-        """Initialize the stripper, expecting a header first."""
-        self._header = bytearray()
-        self._in_header = True
 
-    def reset(self) -> None:
-        """Expect a new header, as every leg of a live session is a WAV stream of its own."""
-        self._header.clear()
-        self._in_header = True
-
-    def feed(self, data: bytes) -> bytes:
-        """Return the PCM in ``data``, holding back header bytes until all 44 arrive.
-
-        Args:
-            data: The next bytes of the WAV stream.
-
-        Returns:
-            The PCM bytes that follow the header, possibly empty.
-
-        Raises:
-            WavHeaderError: If the header describes anything but 24 kHz 16-bit mono PCM.
-        """
-        if not self._in_header:
-            return data
-        missing = _WAV_HEADER.size - len(self._header)
-        self._header += data[:missing]
-        if len(self._header) < _WAV_HEADER.size:
-            return b""
-        riff, _, wave, fmt, fmt_size, encoding, channels, rate, _, _, bits, data_id, _ = (
-            _WAV_HEADER.unpack(self._header)
-        )
-        if (riff, wave, fmt, fmt_size, encoding, channels, rate, bits, data_id) != _EXPECTED_WAV:
-            raise WavHeaderError("Paxa TTS returned audio in an unexpected format")
-        self._in_header = False
-        return data[missing:]
+def is_pcm_at(content_type: str, rate: int) -> bool:
+    """Whether a content type is mono pcm at ``rate``, as ``audio/pcm;rate=<R>;channels=1``."""
+    mime, *params = content_type.split(";")
+    fields: dict[str, str] = {}
+    for param in params:
+        name, _, value = param.partition("=")
+        fields[name.strip().lower()] = value.strip().strip('"')
+    return (
+        mime.strip().lower() == "audio/pcm"
+        and fields.get("rate") == str(rate)
+        and fields.get("channels", "1") == "1"
+    )
 
 
 # Paxa error codes are lowercase identifiers. Anything else found where a code
@@ -146,6 +119,7 @@ _ERROR_CATEGORIES: dict[str, ErrorCategory] = {
     "live_protocol": ErrorCategory.INVALID_REQUEST,
     "unknown_model": ErrorCategory.INVALID_REQUEST,
     "unknown_voice": ErrorCategory.INVALID_REQUEST,
+    "unsupported_format": ErrorCategory.INVALID_REQUEST,
     # The text, not the service, was refused, so the next sentence may speak.
     "text_too_long": ErrorCategory.APPLICATION,
     "tag_invalid": ErrorCategory.APPLICATION,
@@ -167,6 +141,7 @@ _ERROR_HINTS: dict[str, str] = {
     "key_limit": "the API key reached its spending cap",
     "unknown_voice": "GET /v1/voices lists the voice ids",
     "unknown_model": "GET /v1/models lists the model ids",
+    "unsupported_format": "the model doesn't serve pcm at the sample rate asked for",
     "rate_limited": "the plan's requests per minute are used up",
     "concurrency_limited": "the plan's concurrent connections are in use",
     "tag_invalid": "the text holds a tag the voice does not read",

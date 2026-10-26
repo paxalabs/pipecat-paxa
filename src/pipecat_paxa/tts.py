@@ -16,7 +16,7 @@ import asyncio
 import json
 import os
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, TypeGuard
 
@@ -36,20 +36,20 @@ from websockets.protocol import State
 from ._api import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    DEFAULT_SAMPLE_RATE,
     DEFAULT_VOICE,
-    SAMPLE_RATE,
-    WavHeaderError,
-    WavHeaderStripper,
     check_language,
     check_speed,
     error_category,
     error_code,
     error_message,
+    is_pcm_at,
     live_url,
     normalize_base_url,
     paxa_language,
     problem_code,
     request_headers,
+    request_sample_rate,
 )
 from ._live import LegWords, LiveSession
 from ._thai import use_thai_sentence_ends
@@ -73,6 +73,7 @@ _CLOSING_ERRORS = frozenset(
         "key_limit",
         "unknown_model",
         "unknown_voice",
+        "unsupported_format",
         "live_protocol",
         "internal",
     }
@@ -168,8 +169,9 @@ class PaxaTTSService(WebsocketTTSService):
 
     One live session serves the whole conversation. Each sentence goes out as
     soon as it is complete, and an interruption cancels the speech in flight
-    without reconnecting. Audio is 24 kHz 16-bit mono, resampled to the
-    pipeline's output rate when that differs.
+    without reconnecting. Paxa sends 16-bit mono pcm at the pipeline's output
+    rate when the model serves that rate, so it plays as it arrives. Otherwise
+    it sends 24 kHz, which is resampled to the pipeline's rate.
 
     Paxa bills speech with word timestamps at 1.25 times the standard rate, so
     they are off unless ``word_timestamps`` is set. Without them, each sentence's
@@ -233,7 +235,8 @@ class PaxaTTSService(WebsocketTTSService):
         self._word_timestamps = word_timestamps
 
         self._live = LiveSession()
-        self._wav = WavHeaderStripper()
+        # The pcm rate the open session asked for in its start frame.
+        self._session_rate = DEFAULT_SAMPLE_RATE
         self._odd_byte = b""
         self._leg_words: LegWords | None = None
         self._connection_id: str | None = None
@@ -372,11 +375,14 @@ class PaxaTTSService(WebsocketTTSService):
                 return
             logger.debug(f"{self}: connecting to Paxa")
             self._reset_session()
+            # Pipecat sets the output rate in setup(), before the service connects.
+            start = self._start_frame()
             websocket = await self._websocket_connect(
                 live_url(self._base_url), additional_headers=request_headers(self._api_key)
             )
             self._websocket = websocket
-            await websocket.send(json.dumps(self._start_frame()))
+            self._session_rate = start["sample_rate"]
+            await websocket.send(json.dumps(start))
             self._last_activity = time.monotonic()
         except Exception as e:
             message, category, exception = _connection_failure(e)
@@ -400,7 +406,6 @@ class PaxaTTSService(WebsocketTTSService):
     def _reset_session(self):
         self._live.reset()
         self._session_started.clear()
-        self._wav.reset()
         self._odd_byte = b""
         self._leg_words = None
         self._connection_id = None
@@ -410,7 +415,8 @@ class PaxaTTSService(WebsocketTTSService):
             "type": "start",
             "model": self._settings.model,
             "voice": self._settings.voice,
-            "format": "wav",
+            "format": "pcm",
+            "sample_rate": request_sample_rate(self._settings.model, self.sample_rate),
         }
         if self._word_timestamps:
             frame["timestamps"] = "word"
@@ -526,23 +532,17 @@ class PaxaTTSService(WebsocketTTSService):
         if leg is None:
             # Audio of cancelled speech, which arrives until Paxa answers the cancel.
             return
-        try:
-            pcm = self._wav.feed(data)
-        except WavHeaderError as e:
-            await self._abandon_active()
-            await self.push_error(
-                error_msg=str(e), category=ErrorCategory.SERVER, force_treat_as_permanent=True
-            )
-            return
-        pcm = self._odd_byte + pcm
+        pcm = self._odd_byte + data
         if len(pcm) % 2:
             self._odd_byte, pcm = pcm[-1:], pcm[:-1]
         else:
             self._odd_byte = b""
         if not pcm:
             return
-        leg.context.audio_bytes += len(pcm)
-        audio = await self._resampler.resample(pcm, SAMPLE_RATE, self.sample_rate)
+        leg.context.audio_seconds += len(pcm) / (2 * self._session_rate)
+        audio = pcm
+        if self._session_rate != self.sample_rate:
+            audio = await self._resampler.resample(pcm, self._session_rate, self.sample_rate)
         if audio:
             context_id = leg.context.context_id
             await self.append_to_audio_context(
@@ -556,8 +556,7 @@ class PaxaTTSService(WebsocketTTSService):
         leg = self._live.on_charged(seq, chars)
         if leg is None:
             return
-        # Every leg's audio is a WAV stream of its own, header included.
-        self._wav.reset()
+        # Every leg's audio is a stream of its own, of whole 16-bit samples.
         self._odd_byte = b""
         self._leg_words = LegWords(leg.text, leg.offset) if self._word_timestamps else None
 
@@ -627,8 +626,9 @@ class PaxaTTSService(WebsocketTTSService):
 class PaxaHttpTTSService(TTSService):
     """Paxa text-to-speech over ``POST /v1/tts``.
 
-    Each sentence is one streamed request. Audio is 24 kHz 16-bit mono,
-    resampled to the pipeline's output rate when that differs.
+    Each sentence is one streamed request. Paxa sends 16-bit mono pcm at the
+    pipeline's output rate when the model serves that rate, so it plays as it
+    arrives. Otherwise it sends 24 kHz, which is resampled to the pipeline's rate.
 
     Example::
 
@@ -747,10 +747,11 @@ class PaxaHttpTTSService(TTSService):
         """
         if self._session is None:
             self._session = aiohttp.ClientSession()
+        rate = request_sample_rate(self._settings.model, self.sample_rate)
         try:
             async with self._session.post(
                 f"{self._base_url}/v1/tts",
-                json=self._request_body(text),
+                json=self._request_body(text, rate),
                 headers=request_headers(self._api_key),
                 timeout=_HTTP_TIMEOUT,
             ) as response:
@@ -762,21 +763,20 @@ class PaxaHttpTTSService(TTSService):
                         or classify_http_status_code(response.status),
                     )
                     return
-                if response.content_type != "audio/wav":
+                # Paxa's request id identifies the request in its support logs.
+                logger.debug(f"{self}: Paxa request {response.headers.get('x-request-id')}")
+                if not is_pcm_at(response.headers.get("Content-Type", ""), rate):
                     yield ErrorFrame(
-                        error="Paxa TTS returned a response that is not audio",
+                        error=f"Paxa TTS returned audio that is not mono pcm at the {rate} Hz "
+                        "the request asked for",
                         category=ErrorCategory.SERVER,
                     )
                     return
-                # Paxa's request id identifies the request in its support logs.
-                logger.debug(f"{self}: Paxa request {response.headers.get('x-request-id')}")
                 await self.start_tts_usage_metrics(text)
                 async for frame in self._stream_audio_frames_from_iterator(
-                    _pcm_chunks(response), in_sample_rate=SAMPLE_RATE, context_id=context_id
+                    response.content.iter_any(), in_sample_rate=rate, context_id=context_id
                 ):
                     yield frame
-        except WavHeaderError as e:
-            yield ErrorFrame(error=str(e), category=ErrorCategory.SERVER)
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, TimeoutError) as e:
             yield ErrorFrame(
                 error=f"Paxa TTS request failed: {type(e).__name__}",
@@ -791,12 +791,13 @@ class PaxaHttpTTSService(TTSService):
                 category=ErrorCategory.UNKNOWN,
             )
 
-    def _request_body(self, text: str) -> dict[str, Any]:
+    def _request_body(self, text: str, sample_rate: int) -> dict[str, Any]:
         body: dict[str, Any] = {
             "text": text,
             "voice": self._settings.voice,
             "model": self._settings.model,
-            "format": "wav",
+            "format": "pcm",
+            "sample_rate": sample_rate,
             "stream": True,
         }
         if self._settings.speed is not None:
@@ -804,13 +805,6 @@ class PaxaHttpTTSService(TTSService):
         if self._settings.language is not None:
             body["language"] = self._settings.language
         return body
-
-
-async def _pcm_chunks(response: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
-    wav = WavHeaderStripper()
-    async for chunk in response.content.iter_any():
-        if pcm := wav.feed(chunk):
-            yield pcm
 
 
 def _connection_failure(e: Exception) -> tuple[str, ErrorCategory, Exception | None]:

@@ -1,4 +1,5 @@
 import pytest
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     ErrorFrame,
     InterruptionFrame,
@@ -21,10 +22,17 @@ from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregate
 
 from pipecat_paxa import PaxaHttpTTSService, PaxaTTSService, __version__
 from pipecat_paxa import tts as tts_module
+from pipecat_paxa._api import is_pcm_at
 
-from .fake_paxa import API_KEY, Behavior, FakePaxa, leg_pcm, utf16_len, wav_header
+from .fake_paxa import API_KEY, Behavior, FakePaxa, leg_pcm, utf16_len
 
 CLIENT = f"pipecat-paxa/{__version__}"
+V1 = "paxa-tts-flash-v1"
+V2 = "paxa-tts-flash-v2"
+# Flash v1 serves 24 kHz only, and no model serves 11025 Hz, so both get 24 kHz resampled.
+FALLBACKS = [(V1, 8000), (V1, 16000), (V2, 11025)]
+# Long enough for audio to come out of the resampler, which holds back the end of a burst.
+RESAMPLED = "This reply is resampled to the rate of the pipeline."
 
 
 def audio_of(frames) -> bytes:
@@ -45,7 +53,34 @@ def texts_sent(session) -> list[str]:
 
 
 def spoken_audio(session) -> bytes:
-    return b"".join(leg_pcm(leg.seq, utf16_len(leg.text)) for leg in session.legs)
+    return b"".join(leg_pcm(leg.seq, utf16_len(leg.text), session.rate) for leg in session.legs)
+
+
+def audio_rates(frames) -> set[int]:
+    return {f.sample_rate for f in frames if isinstance(f, TTSAudioRawFrame)}
+
+
+def audio_by_context(frames) -> list[bytes]:
+    """Each audio context's audio, in the order the contexts started."""
+    audio: dict[str, bytes] = {}
+    for f in frames:
+        if isinstance(f, TTSAudioRawFrame):
+            audio[f.context_id] = audio.get(f.context_id, b"") + f.audio
+    return list(audio.values())
+
+
+def at_rate(rate: int) -> PipelineParams:
+    return PipelineParams(audio_out_sample_rate=rate)
+
+
+async def assert_resampled(audio: bytes, text: str, rate: int):
+    """Check ``audio`` is the fake's 24 kHz speech of ``text``, resampled to ``rate``.
+
+    Pipecat's stream resampler holds back the end of a burst (about 40 ms, more
+    at uneven ratios), so the length is compared with its own output.
+    """
+    reference = await create_stream_resampler().resample(leg_pcm(1, utf16_len(text)), 24000, rate)
+    assert audio and len(audio) == len(reference)
 
 
 def live(paxa: FakePaxa, **kwargs) -> PaxaTTSService:
@@ -87,7 +122,13 @@ async def test_live_speaks_a_sentence():
     assert session.headers["User-Agent"] == CLIENT
     assert session.headers["Authorization"] == f"Bearer {API_KEY}"
     assert session.frames == [
-        {"type": "start", "model": "paxa-tts-flash-v2", "voice": "foithong", "format": "wav"},
+        {
+            "type": "start",
+            "model": "paxa-tts-flash-v2",
+            "voice": "foithong",
+            "format": "pcm",
+            "sample_rate": 24000,
+        },
         {"type": "text", "text": "Hello there.\n"},
         {"type": "flush"},
     ]
@@ -127,12 +168,95 @@ async def test_live_batches_a_burst_of_sentences():
     assert not errors(up)
 
 
-async def test_live_header_split_across_frames():
-    async with FakePaxa(Behavior(split_header=True)) as paxa:
+async def test_live_samples_split_across_frames():
+    # Odd-sized frames cut samples in two, and the halves are joined again.
+    async with FakePaxa(Behavior(chunk_bytes=1001)) as paxa:
         down, _ = await run_test(
-            live(paxa), frames_to_send=[TTSSpeakFrame(text="Split."), SleepFrame(sleep=0.2)]
+            live(paxa), frames_to_send=[TTSSpeakFrame(text="Split samples."), SleepFrame(sleep=0.2)]
         )
-    assert audio_of(down) == leg_pcm(1, utf16_len("Split.\n"))
+    assert audio_of(down) == leg_pcm(1, utf16_len("Split samples.\n"))
+
+
+@pytest.mark.parametrize("rate", [8000, 16000])
+async def test_live_speaks_at_the_pipeline_rate(rate):
+    text = "Native rate."
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            live(paxa),
+            frames_to_send=[TTSSpeakFrame(text=text), SleepFrame(sleep=0.2)],
+            pipeline_params=at_rate(rate),
+        )
+    (session,) = paxa.sessions
+    assert session.start["sample_rate"] == session.rate == rate
+    # Byte for byte what Paxa sent, so nothing was resampled.
+    assert audio_rates(down) == {rate}
+    assert audio_of(down) == leg_pcm(1, utf16_len(text + "\n"), rate)
+    assert not errors(up)
+
+
+@pytest.mark.parametrize(("model", "rate"), FALLBACKS)
+async def test_live_gets_24khz_and_resamples_a_rate_the_model_lacks(model, rate):
+    text = RESAMPLED
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            live(paxa, settings=PaxaTTSService.Settings(model=model)),
+            frames_to_send=[TTSSpeakFrame(text=text), SleepFrame(sleep=0.2)],
+            pipeline_params=at_rate(rate),
+        )
+    (session,) = paxa.sessions
+    assert session.start["sample_rate"] == session.rate == 24000
+    assert audio_rates(down) == {rate}
+    await assert_resampled(audio_of(down), text + "\n", rate)
+    assert not errors(up)
+
+
+async def test_live_output_rate_stays_fixed_when_the_model_changes():
+    # Each model change opens a session at the rate that model serves, and the
+    # pipeline gets 16 kHz audio throughout.
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            live(paxa),
+            frames_to_send=[
+                TTSSpeakFrame(text="Native."),
+                SleepFrame(sleep=0.2),
+                TTSUpdateSettingsFrame(delta=PaxaTTSService.Settings(model=V1)),
+                SleepFrame(sleep=0.1),
+                TTSSpeakFrame(text=RESAMPLED),
+                SleepFrame(sleep=0.4),
+                TTSUpdateSettingsFrame(delta=PaxaTTSService.Settings(model=V2)),
+                SleepFrame(sleep=0.1),
+                TTSSpeakFrame(text="Native again."),
+                SleepFrame(sleep=0.2),
+            ],
+            pipeline_params=at_rate(16000),
+        )
+    assert [s.start["sample_rate"] for s in paxa.sessions] == [16000, 24000, 16000]
+    assert audio_rates(down) == {16000}
+    first, middle, last = audio_by_context(down)
+    assert first == leg_pcm(1, utf16_len("Native.\n"), 16000)
+    await assert_resampled(middle, RESAMPLED + "\n", 16000)
+    assert last == leg_pcm(1, utf16_len("Native again.\n"), 16000)
+    assert not errors(up)
+
+
+async def test_live_word_times_follow_the_audio_at_the_pipeline_rate():
+    # The second leg's words start where the first leg's audio ended, whatever the rate.
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            live(paxa, word_timestamps=True),
+            frames_to_send=[
+                *llm_turn("Hello there. ", "How are you?", gap=0.15),
+                SleepFrame(sleep=0.3),
+            ],
+            pipeline_params=at_rate(16000),
+        )
+    (session,) = paxa.sessions
+    first, second = session.legs
+    pts = {f.text: f.pts for f in down if isinstance(f, TTSTextFrame)}
+    # The fake speaks 10 ms per character.
+    gap = utf16_len(first.text) + second.text.index("How") - first.text.index("Hello")
+    assert pts["How"] - pts["Hello"] == pytest.approx(gap * 10_000_000, abs=1_000)
+    assert not errors(up)
 
 
 async def test_live_interruption_cancels_without_reconnecting():
@@ -339,21 +463,6 @@ async def test_live_word_timestamps_keep_spacing():
     assert not errors(up)
 
 
-async def test_live_resamples_to_the_pipeline_rate():
-    async with FakePaxa() as paxa:
-        down, _ = await run_test(
-            live(paxa),
-            frames_to_send=[TTSSpeakFrame(text="Resampled."), SleepFrame(sleep=0.2)],
-            pipeline_params=PipelineParams(audio_out_sample_rate=16000),
-        )
-    frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
-    assert frames and all(f.sample_rate == 16000 for f in frames)
-    samples = len(audio_of(down)) // 2
-    expected = utf16_len("Resampled.\n") * 240 * 2 // 3
-    # Pipecat's stream resampler holds back up to about 40 ms until more audio arrives.
-    assert expected - 700 <= samples <= expected
-
-
 async def test_live_settings_update_opens_a_new_session():
     async with FakePaxa() as paxa:
         tts = live(paxa, settings=PaxaTTSService.Settings(language=Language.TH, speed=1.2))
@@ -391,15 +500,21 @@ async def test_live_unusable_settings_update_is_refused():
     assert len(paxa.sessions) == 1
 
 
-async def test_live_unexpected_audio_format_is_not_played():
-    async with FakePaxa(Behavior(header=wav_header(rate=16000))) as paxa:
+async def test_live_unsupported_format_makes_the_service_unusable():
+    # Paxa refuses a start frame whose rate the model doesn't serve and closes the
+    # session, so reconnecting would only be refused again.
+    async with FakePaxa(Behavior(unserved_rates={16000})) as paxa:
         tts = live(paxa)
         down, up = await run_test(
-            tts, frames_to_send=[TTSSpeakFrame(text="Odd."), SleepFrame(sleep=0.3)]
+            tts,
+            frames_to_send=[TTSSpeakFrame(text="Hi."), SleepFrame(sleep=0.3)],
+            pipeline_params=at_rate(16000),
         )
-    assert audio_of(down) == b""
-    assert errors(up)[0].category == ErrorCategory.SERVER
+    assert errors(up)[0].category == ErrorCategory.INVALID_REQUEST
+    assert "unsupported_format" in errors(up)[0].error
     assert not tts.is_usable
+    assert audio_of(down) == b""
+    assert len(paxa.sessions) == 1
 
 
 async def test_live_keepalive_holds_an_idle_session_open(monkeypatch):
@@ -511,7 +626,8 @@ async def test_http_speaks_a_sentence():
         "text": "สวัสดีครับ",
         "voice": "foithong",
         "model": "paxa-tts-flash-v2",
-        "format": "wav",
+        "format": "pcm",
+        "sample_rate": 24000,
         "stream": True,
         "speed": 0.9,
         "language": "th",
@@ -520,10 +636,63 @@ async def test_http_speaks_a_sentence():
     assert request["headers"]["Authorization"] == f"Bearer {API_KEY}"
 
 
-async def test_http_header_split_across_chunks():
-    async with FakePaxa(Behavior(split_header=True)) as paxa:
-        down, _ = await run_test(http(paxa), frames_to_send=[TTSSpeakFrame(text="Split.")])
-    assert audio_of(down) == leg_pcm(1, utf16_len("Split."))
+async def test_http_samples_split_across_chunks():
+    async with FakePaxa(Behavior(chunk_bytes=1001)) as paxa:
+        down, _ = await run_test(http(paxa), frames_to_send=[TTSSpeakFrame(text="Split samples.")])
+    assert audio_of(down) == leg_pcm(1, utf16_len("Split samples."))
+
+
+@pytest.mark.parametrize("rate", [8000, 16000])
+async def test_http_speaks_at_the_pipeline_rate(rate):
+    text = "Native rate."
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            http(paxa), frames_to_send=[TTSSpeakFrame(text=text)], pipeline_params=at_rate(rate)
+        )
+    (request,) = paxa.http_requests
+    assert request["json"]["sample_rate"] == rate
+    # Byte for byte what Paxa sent, so nothing was resampled.
+    assert audio_rates(down) == {rate}
+    assert audio_of(down) == leg_pcm(1, utf16_len(text), rate)
+    assert not errors(up)
+
+
+@pytest.mark.parametrize(("model", "rate"), FALLBACKS)
+async def test_http_gets_24khz_and_resamples_a_rate_the_model_lacks(model, rate):
+    text = RESAMPLED
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            http(paxa, settings=PaxaHttpTTSService.Settings(model=model)),
+            frames_to_send=[TTSSpeakFrame(text=text)],
+            pipeline_params=at_rate(rate),
+        )
+    (request,) = paxa.http_requests
+    assert request["json"]["sample_rate"] == 24000
+    assert audio_rates(down) == {rate}
+    await assert_resampled(audio_of(down), text, rate)
+    assert not errors(up)
+
+
+async def test_http_output_rate_stays_fixed_when_the_model_changes():
+    async with FakePaxa() as paxa:
+        down, up = await run_test(
+            http(paxa),
+            frames_to_send=[
+                TTSSpeakFrame(text="Native."),
+                TTSUpdateSettingsFrame(delta=PaxaHttpTTSService.Settings(model=V1)),
+                TTSSpeakFrame(text=RESAMPLED),
+                TTSUpdateSettingsFrame(delta=PaxaHttpTTSService.Settings(model=V2)),
+                TTSSpeakFrame(text="Native again."),
+            ],
+            pipeline_params=at_rate(16000),
+        )
+    assert [r["json"]["sample_rate"] for r in paxa.http_requests] == [16000, 24000, 16000]
+    assert audio_rates(down) == {16000}
+    first, middle, last = audio_by_context(down)
+    assert first == leg_pcm(1, utf16_len("Native."), 16000)
+    await assert_resampled(middle, RESAMPLED, 16000)
+    assert last == leg_pcm(1, utf16_len("Native again."), 16000)
+    assert not errors(up)
 
 
 async def test_http_error_is_reported_by_code():
@@ -540,11 +709,47 @@ async def test_http_error_is_reported_by_code():
     assert audio_of(down) == b""
 
 
-async def test_http_unexpected_audio_format_is_not_played():
-    async with FakePaxa(Behavior(header=wav_header(channels=2))) as paxa:
-        down, up = await run_test(http(paxa), frames_to_send=[TTSSpeakFrame(text="Odd.")])
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "audio/pcm;rate=24000;channels=1",
+        "audio/pcm;channels=1",
+        "audio/pcm;rate=16000;channels=2",
+        "audio/wav",
+    ],
+)
+async def test_http_audio_other_than_the_pcm_asked_for_is_not_played(content_type):
+    async with FakePaxa(Behavior(content_type=content_type)) as paxa:
+        down, up = await run_test(
+            http(paxa), frames_to_send=[TTSSpeakFrame(text="Odd.")], pipeline_params=at_rate(16000)
+        )
     assert audio_of(down) == b""
-    assert errors(up)[0].category == ErrorCategory.SERVER
+    (error,) = errors(up)
+    assert error.category == ErrorCategory.SERVER
+    assert error.error == (
+        "Paxa TTS returned audio that is not mono pcm at the 16000 Hz the request asked for"
+    )
+
+
+def test_pcm_content_type_reads_as_written():
+    assert is_pcm_at("audio/pcm;rate=16000;channels=1", 16000)
+    assert is_pcm_at('Audio/PCM; Rate="16000"', 16000)
+    assert not is_pcm_at("audio/pcm;rate=16000;channels=1", 24000)
+    assert not is_pcm_at("", 16000)
+
+
+async def test_http_unsupported_format_is_reported_by_code():
+    async with FakePaxa(Behavior(unserved_rates={16000})) as paxa:
+        down, up = await run_test(
+            http(paxa), frames_to_send=[TTSSpeakFrame(text="Hi.")], pipeline_params=at_rate(16000)
+        )
+    (error,) = errors(up)
+    assert error.category == ErrorCategory.INVALID_REQUEST
+    assert error.error == (
+        "Paxa TTS error (HTTP 400): unsupported_format "
+        "(the model doesn't serve pcm at the sample rate asked for)"
+    )
+    assert audio_of(down) == b""
 
 
 async def test_http_unreachable_api_is_a_connectivity_error():

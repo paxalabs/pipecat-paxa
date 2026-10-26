@@ -220,7 +220,7 @@ def test_leg_offsets_follow_the_context_audio():
     session.next_frame(0.0)
     leg = charge(session, 1, "One.\n")
     assert leg is not None and leg.offset == 0.0
-    leg.context.audio_bytes += 48000  # one second
+    leg.context.audio_seconds += 1.0
     session.on_flushed(1)
     session.add_text("a", "Two.")
     session.next_frame(0.1)

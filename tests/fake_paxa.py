@@ -7,15 +7,18 @@
 """A local stand-in for the Paxa API: ``POST /v1/tts`` and the ``/v1/tts/live`` socket.
 
 It follows the documented contract: Bearer or ``x-api-key`` auth, RFC 9457 error
-bodies, streamed WAV with 0xFFFFFFFF sizes, and the live socket's frames and
-events. The live session works like Paxa's: frames are handled one at a time,
-a ``cancel`` jumps the queue and drops every frame sent before it, text
-auto-flushes on a newline, end punctuation or 400 buffered characters, a flush
-with nothing to speak answers ``flushed`` with the last leg's seq, and a session
-closes with 4413 once 32 frames wait.
+bodies, streamed pcm (16-bit mono, no header) at the requested sample rate with
+``audio/pcm;rate=<R>;channels=1``, and the live socket's frames and events. A
+rate the model doesn't serve answers ``unsupported_format``, as Paxa does. Only
+pcm is served: the stand-in answers ``unsupported_format`` for every other
+format, which Paxa serves. The live session works like Paxa's: frames are
+handled one at a time, a ``cancel`` jumps the queue and drops every frame sent
+before it, text auto-flushes on a newline, end punctuation or 400 buffered
+characters, a flush with nothing to speak answers ``flushed`` with the last
+leg's seq, and a session closes with 4413 once 32 frames wait.
 
-Audio is deterministic: a leg of N characters is N * 240 samples (10 ms per
-character) whose value is the leg's seq.
+Audio is deterministic: a leg of N characters is 10 ms per character at the
+requested rate (N * rate // 100 samples), and every sample is the leg's seq.
 """
 
 import asyncio
@@ -29,41 +32,23 @@ from aiohttp import WSMsgType, web
 
 API_KEY = "pxa_test_key"
 VOICES = {"foithong", "massaman"}
-MODELS = {"paxa-tts-flash-v2", "paxa-tts-flash-v1"}
 MAX_CHARS = 5000
 AUTO_FLUSH_CHARS = 400
 MAX_PENDING_FRAMES = 32
-SAMPLE_RATE = 24000
-SAMPLES_PER_CHAR = 240
+FORMATS = ("mp3", "opus", "wav", "pcm", "mulaw", "alaw")
+# The rates the schema takes, and the ones each model serves.
+RATES = (8000, 16000, 22050, 24000, 32000, 44100, 48000)
+DEFAULT_RATE = 24000
+MODEL_RATES = {"paxa-tts-flash-v2": set(RATES), "paxa-tts-flash-v1": {DEFAULT_RATE}}
+MODELS = set(MODEL_RATES)
 SENTENCE_END = re.compile(r"[.!?…。！？][\"'”’」』)）]*\s*$")
 TAG = re.compile(r"\[[^\]\n]*\]")
 REFUSED_TAG = "[british accent]"
 
 
-def wav_header(*, rate: int = SAMPLE_RATE, channels: int = 1, bits: int = 16) -> bytes:
-    """A streamed WAV header, with 0xFFFFFFFF sizes."""
-    byte_rate = rate * channels * bits // 8
-    return struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        0xFFFFFFFF,
-        b"WAVE",
-        b"fmt ",
-        16,
-        1,
-        channels,
-        rate,
-        byte_rate,
-        channels * bits // 8,
-        bits,
-        b"data",
-        0xFFFFFFFF,
-    )
-
-
-def leg_pcm(seq: int, chars: int) -> bytes:
-    """The PCM the fake speaks for leg ``seq`` of ``chars`` characters."""
-    return struct.pack("<h", seq % 32000) * (chars * SAMPLES_PER_CHAR)
+def leg_pcm(seq: int, chars: int, rate: int = DEFAULT_RATE) -> bytes:
+    """The pcm the fake speaks at ``rate`` for leg ``seq`` of ``chars`` characters."""
+    return struct.pack("<h", seq % 32000) * (chars * rate // 100)
 
 
 def problem(code: str, status: int) -> web.Response:
@@ -71,6 +56,13 @@ def problem(code: str, status: int) -> web.Response:
         status=status,
         body=json.dumps({"title": code, "status": status}).encode(),
         content_type="application/problem+json",
+    )
+
+
+def serves(behavior: "Behavior", model: str, audio_format: str, rate: int) -> bool:
+    """Whether the fake serves ``audio_format`` at ``rate`` on ``model``."""
+    return (
+        audio_format == "pcm" and rate in MODEL_RATES[model] and rate not in behavior.unserved_rates
     )
 
 
@@ -93,9 +85,7 @@ def word_spans(text: str) -> list[dict[str, Any]]:
         word = match.group().strip(".,!?;:\"'")
         if not word:
             continue
-        start = match.start() * SAMPLES_PER_CHAR / SAMPLE_RATE
-        end = match.end() * SAMPLES_PER_CHAR / SAMPLE_RATE
-        spans.append({"text": word, "start": start, "end": end})
+        spans.append({"text": word, "start": match.start() / 100, "end": match.end() / 100})
     return spans
 
 
@@ -114,10 +104,10 @@ class Behavior:
     rate_limited_attempts: set[int] = field(default_factory=set)
     # Legs (by seq) whose synthesis fails after the receipt.
     failing_legs: set[int] = field(default_factory=set)
-    # Split the first audio frame of each leg inside the WAV header.
-    split_header: bool = False
-    # A WAV header for another format, to test that it isn't played.
-    header: bytes | None = None
+    # Rates refused with unsupported_format even where the model serves them.
+    unserved_rates: set[int] = field(default_factory=set)
+    # The content type of POST /v1/tts audio, to test that the wrong one isn't played.
+    content_type: str | None = None
     idle_timeout: float | None = None
     # Never answer cancel, to test the client's recovery.
     ignore_cancel: bool = False
@@ -142,6 +132,9 @@ class Leg:
 @dataclass
 class SessionLog:
     headers: dict[str, str]
+    # The start frame, and the pcm rate the session was served at once it started.
+    start: dict[str, Any] | None = None
+    rate: int | None = None
     frames: list[dict[str, Any]] = field(default_factory=list)
     legs: list[Leg] = field(default_factory=list)
     # What the server sent, in order: event types with their seq ("flushed:1"),
@@ -198,7 +191,8 @@ class FakePaxa:
             or not text
             or not isinstance(body.get("voice"), str)
             or not isinstance(body.get("model"), str)
-            or body.get("format", "mp3") not in ("mp3", "opus", "wav")
+            or body.get("format", "mp3") not in FORMATS
+            or body.get("sample_rate", DEFAULT_RATE) not in RATES
             or body.get("language", "auto") not in ("auto", "th", "en", "zh")
             or not isinstance(speed, int | float)
             or not 0.5 <= speed <= 1.5
@@ -206,6 +200,9 @@ class FakePaxa:
             return problem("validation", 400)
         if body["model"] not in MODELS:
             return problem("unknown_model", 400)
+        rate = body.get("sample_rate", DEFAULT_RATE)
+        if not serves(self.behavior, body["model"], body.get("format", "mp3"), rate):
+            return problem("unsupported_format", 400)
         if body["voice"] not in VOICES:
             return problem("unknown_voice", 400)
         if len(text) > MAX_CHARS:
@@ -215,18 +212,18 @@ class FakePaxa:
 
         response = web.StreamResponse(
             headers={
-                "content-type": "audio/wav",
+                "content-type": self.behavior.content_type or f"audio/pcm;rate={rate};channels=1",
                 "x-request-id": "req_test",
                 "x-credits-charged": "0.5",
             }
         )
         await response.prepare(request)
-        data = (self.behavior.header or wav_header()) + leg_pcm(1, utf16_len(text))
-        first = 20 if self.behavior.split_header else self.behavior.chunk_bytes
-        await response.write(data[:first])
-        for at in range(first, len(data), self.behavior.chunk_bytes):
+        data = leg_pcm(1, utf16_len(text), rate)
+        size = self.behavior.chunk_bytes
+        await response.write(data[:size])
+        for at in range(size, len(data), size):
             await asyncio.sleep(self.behavior.chunk_delay)
-            await response.write(data[at : at + self.behavior.chunk_bytes])
+            await response.write(data[at : at + size])
         await response.write_eof()
         return response
 
@@ -252,6 +249,7 @@ class _LiveSession:
         self.behavior = behavior
         self.phase = "awaiting_start"
         self.timestamps: str | None = None
+        self.rate = DEFAULT_RATE
         self.buffer = ""
         self.carry: str | None = None
         self.seq = 0
@@ -416,15 +414,22 @@ class _LiveSession:
             await self.close(1000, "session complete")
 
     async def start(self, frame: dict[str, Any]) -> None:
+        self.log.start = frame
         if frame["model"] not in MODELS:
             await self.send({"type": "error", "code": "unknown_model"})
             await self.close(4400, "unknown model")
+            return
+        rate = frame.get("sample_rate", DEFAULT_RATE)
+        if not serves(self.behavior, frame["model"], frame.get("format", "mp3"), rate):
+            await self.send({"type": "error", "code": "unsupported_format"})
+            await self.close(4400, "unsupported format")
             return
         if frame["voice"] not in VOICES:
             await self.send({"type": "error", "code": "unknown_voice"})
             await self.close(4400, "unknown voice")
             return
         self.phase = "active"
+        self.rate = self.log.rate = rate
         self.timestamps = frame.get("timestamps")
         started: dict[str, Any] = {
             "type": "started",
@@ -494,11 +499,9 @@ class _LiveSession:
             await self.send({"type": "error", "code": "provider_error", "seq": seq})
             return False
 
-        data = (self.behavior.header or wav_header()) + leg_pcm(seq, chars)
+        data = leg_pcm(seq, chars, self.rate)
         size = self.behavior.chunk_bytes
-        cuts = [0, 20] if self.behavior.split_header else [0]
-        cuts += list(range(cuts[-1] + size, len(data), size))
-        chunks = [data[a:b] for a, b in zip(cuts, cuts[1:] + [len(data)], strict=True)]
+        chunks = [data[at : at + size] for at in range(0, len(data), size)]
         spans = word_spans(text) if self.timestamps == "word" else []
         halves = [spans[: len(spans) // 2], spans[len(spans) // 2 :]]
         for index, chunk in enumerate(chunks):
@@ -530,7 +533,8 @@ def _valid(frame: dict[str, Any]) -> bool:
         return (
             isinstance(frame.get("model"), str)
             and isinstance(frame.get("voice"), str)
-            and frame.get("format", "mp3") in ("mp3", "opus", "wav")
+            and frame.get("format", "mp3") in FORMATS
+            and frame.get("sample_rate", DEFAULT_RATE) in RATES
             and frame.get("timestamps", "word") in ("word", "sentence", "utterance")
             and isinstance(speed, int | float)
             and 0.5 <= speed <= 1.5

@@ -126,8 +126,12 @@ Open http://localhost:7860 in your browser and talk to the bot.
 
 ## Notes
 
-- **Audio**: Both services request 24 kHz 16-bit mono audio from Paxa, which Pipecat
-  resamples when the pipeline's output rate differs, as on 8 kHz phone calls.
+- **Audio**: Both services ask Paxa for raw 16-bit mono pcm at the pipeline's output
+  rate, so the audio plays as it arrives, with no resampling. Flash v2 serves 8, 16,
+  22.05, 24, 32, 44.1 and 48 kHz, which covers 8 kHz phone calls and 16 kHz pipelines.
+  At any other rate, and on Flash v1, which serves 24 kHz only, the services ask for
+  24 kHz and Pipecat resamples it. `PaxaHttpTTSService` checks that each response is pcm
+  at the rate it asked for, and reports an error rather than play anything else.
 - **Plan limits**: An open live session holds one of your plan's concurrent speech
   connections for as long as the service runs, and each synthesized segment counts as a
   request toward the plan's per-minute limit. Speech refused for a limit is reported as an

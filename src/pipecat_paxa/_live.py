@@ -30,8 +30,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from ._api import BYTES_PER_SECOND
-
 # Stays well inside Paxa's per-leg ceiling (max_chars, 5000 today) and its frame limit.
 MAX_FRAME_CHARS = 2000
 # How long a sent frame may go without starting a leg (a frame of tags alone
@@ -59,7 +57,7 @@ class LiveContext:
         flush_sent: The closing ``flush`` went out.
         sent: Some frame of this context reached the socket.
         tagged: Its text holds a tag, so the session's carried delivery resets after it.
-        audio_bytes: PCM bytes delivered for this context so far.
+        audio_seconds: Seconds of audio delivered for this context so far.
     """
 
     context_id: str
@@ -68,7 +66,7 @@ class LiveContext:
     flush_sent: bool = False
     sent: bool = False
     tagged: bool = False
-    audio_bytes: int = 0
+    audio_seconds: float = 0.0
 
 
 @dataclass(eq=False)
@@ -281,7 +279,7 @@ class LiveSession:
             seq=seq,
             context=context,
             text="".join(frame.text for frame in claimed) if exact and claimed else None,
-            offset=context.audio_bytes / BYTES_PER_SECOND,
+            offset=context.audio_seconds,
             answers_flush=not claimed and bool(self._answers) and self._answers[0] is context,
         )
         return self._leg
