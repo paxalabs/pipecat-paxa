@@ -108,6 +108,12 @@ class Behavior:
     unserved_rates: set[int] = field(default_factory=set)
     # The content type of POST /v1/tts audio, to test that the wrong one isn't played.
     content_type: str | None = None
+    # The live `started` event echoes the format and rate it will send, as Paxa does.
+    # started_echo=False is a server from before the echo; the overrides make a session
+    # that differs from the request, to test that its audio isn't played.
+    started_echo: bool = True
+    started_format: str | None = None
+    started_rate: int | None = None
     idle_timeout: float | None = None
     # Never answer cancel, to test the client's recovery.
     ignore_cancel: bool = False
@@ -437,6 +443,9 @@ class _LiveSession:
             "model": frame["model"],
             "voice": frame["voice"],
         }
+        if self.behavior.started_echo:
+            started["format"] = self.behavior.started_format or frame.get("format", "mp3")
+            started["sample_rate"] = self.behavior.started_rate or rate
         await self.send(started)
 
     async def text(self, text: str, frame_no: int) -> None:

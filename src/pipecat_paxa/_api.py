@@ -110,6 +110,15 @@ def is_pcm_at(content_type: str, rate: int) -> bool:
     )
 
 
+def is_started_pcm_at(event: dict[str, object], rate: int) -> bool:
+    """Whether a live ``started`` event confirms pcm at ``rate``.
+
+    Paxa echoes the format and rate it will send. A server from before the echo leaves
+    both out, and its session is taken as asked.
+    """
+    return event.get("format", "pcm") == "pcm" and event.get("sample_rate", rate) == rate
+
+
 # Paxa error codes are lowercase identifiers. Anything else found where a code
 # belongs is dropped, so an error never carries response text into logs.
 _ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")

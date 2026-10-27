@@ -403,6 +403,37 @@ async def test_live_unknown_voice_makes_the_service_unusable():
     assert len(paxa.sessions) == 1
 
 
+@pytest.mark.parametrize(
+    "behavior",
+    [Behavior(started_rate=24000), Behavior(started_format="mp3")],
+    ids=["other_rate", "other_format"],
+)
+async def test_live_session_unlike_the_request_makes_the_service_unusable(behavior):
+    # Audio at another rate would play at the wrong speed, so none is played, as on HTTP.
+    async with FakePaxa(behavior) as paxa:
+        tts = live(paxa)
+        down, up = await run_test(
+            tts,
+            frames_to_send=[TTSSpeakFrame(text="Hi."), SleepFrame(sleep=0.3)],
+            pipeline_params=at_rate(16000),
+        )
+    assert errors(up)[0].category == ErrorCategory.SERVER
+    assert "16000" in errors(up)[0].error
+    assert not tts.is_usable
+    assert audio_of(down) == b""
+    assert len(paxa.sessions) == 1
+
+
+async def test_live_session_without_the_echo_is_taken_as_asked():
+    # A server from before the echo leaves out format and sample_rate.
+    async with FakePaxa(Behavior(started_echo=False)) as paxa:
+        down, up = await run_test(
+            live(paxa), frames_to_send=[TTSSpeakFrame(text="No echo."), SleepFrame(sleep=0.2)]
+        )
+    assert audio_of(down) == leg_pcm(1, utf16_len("No echo.\n"))
+    assert not errors(up)
+
+
 async def test_live_bad_key_is_an_authentication_error():
     async with FakePaxa() as paxa:
         tts = PaxaTTSService(api_key="pxa_wrong", base_url=paxa.base_url)

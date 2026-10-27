@@ -44,6 +44,7 @@ from ._api import (
     error_code,
     error_message,
     is_pcm_at,
+    is_started_pcm_at,
     live_url,
     normalize_base_url,
     paxa_language,
@@ -508,6 +509,19 @@ class PaxaTTSService(WebsocketTTSService):
             return
         kind = event.get("type")
         if kind == "started":
+            if not is_started_pcm_at(event, self._session_rate):
+                # Audio at another rate would play at the wrong speed, so none is played, as
+                # on HTTP. Asking again would get the same session.
+                await self.push_error(
+                    error_msg=f"Paxa started the live session as {event.get('format')} at "
+                    f"{event.get('sample_rate')} Hz, not the pcm at {self._session_rate} Hz "
+                    "it was asked for",
+                    category=ErrorCategory.SERVER,
+                    force_treat_as_permanent=True,
+                )
+                if self._websocket is not None:
+                    await self._websocket.close()
+                return
             connection = event.get("connection")
             self._connection_id = connection if isinstance(connection, str) else None
             # Paxa's connection id identifies the session in its support logs.
